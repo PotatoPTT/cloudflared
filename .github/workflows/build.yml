@@ -1,0 +1,242 @@
+name: Build Cloudflared (Multi-Arch)
+
+on:
+  schedule:
+    - cron: '0 9 * * *'   # 06:00 BRT
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build.yml'
+      - 'Dockerfile'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Specific cloudflared version (e.g. 2026.11.1). Empty = latest release.'
+        required: false
+        default: ''
+        type: string
+      force:
+        description: 'Force rebuild even if tag already exists in GHCR'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: build-cloudflared
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: Build & Publish Multi-Arch Cloudflared
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve cloudflared version & check GHCR
+        id: meta
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_VERSION: ${{ inputs.version }}
+          FORCE_BUILD: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+
+          OWNER=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${OWNER}/cloudflared"
+
+          LATEST_TAG=$(curl -fsSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/cloudflare/cloudflared/releases/latest | jq -r '.tag_name')
+          LATEST_VERSION="${LATEST_TAG#v}"
+
+          if [ -n "${INPUT_VERSION}" ]; then
+            VERSION="${INPUT_VERSION#v}"
+          else
+            VERSION="${LATEST_VERSION}"
+          fi
+
+          IS_LATEST="false"
+          if [ "${VERSION}" = "${LATEST_VERSION}" ]; then
+            IS_LATEST="true"
+          fi
+
+          TAGS="${IMAGE}:${VERSION}"
+          if [ "${IS_LATEST}" = "true" ]; then
+            TAGS="${TAGS}"$'\n'"${IMAGE}:latest"
+          fi
+
+          echo "owner=${OWNER}" >> "$GITHUB_OUTPUT"
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "is_latest=${IS_LATEST}" >> "$GITHUB_OUTPUT"
+          {
+            echo "tags<<EOF"
+            echo "${TAGS}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Target cloudflared version: ${VERSION} (latest: ${LATEST_VERSION}, is_latest: ${IS_LATEST})"
+
+          if [ "${FORCE_BUILD}" != "true" ]; then
+            EXISTING_RAW=$(docker buildx imagetools inspect --raw "${IMAGE}:${VERSION}" 2>/dev/null || true)
+            if [ -n "${EXISTING_RAW}" ] \
+              && echo "${EXISTING_RAW}" | jq -e '.manifests[] | select(.platform.os=="linux" and .platform.architecture=="amd64")' >/dev/null 2>&1 \
+              && echo "${EXISTING_RAW}" | jq -e '.manifests[] | select(.platform.os=="linux" and .platform.architecture=="arm64")' >/dev/null 2>&1 \
+              && echo "${EXISTING_RAW}" | jq -e '.manifests[] | select(.platform.os=="linux" and .platform.architecture=="arm" and .platform.variant=="v7")' >/dev/null 2>&1; then
+              echo "✅ ${IMAGE}:${VERSION} already published with amd64, arm64, and arm/v7. Nothing to do."
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          echo "🚀 Build required for ${IMAGE}:${VERSION}"
+          echo "should_build=true" >> "$GITHUB_OUTPUT"
+
+      - name: Clone cloudflare/cloudflared
+        if: steps.meta.outputs.should_build == 'true'
+        id: source
+        env:
+          TARGET_VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/cloudflared
+          git clone --depth 1 --branch "${TARGET_VERSION}" https://github.com/cloudflare/cloudflared.git /tmp/cloudflared
+          BUILD_TIME=$(TZ=UTC git -C /tmp/cloudflared log -1 --format="%ad" --date=format:'%Y-%m-%d-%H:%M UTC' -- RELEASE_NOTES || true)
+          if [ -z "${BUILD_TIME}" ]; then
+            BUILD_TIME=$(date -u '+%Y-%m-%d-%H:%M UTC')
+          fi
+          echo "build_time=${BUILD_TIME}" >> "$GITHUB_OUTPUT"
+          echo "Detected BuildTime: ${BUILD_TIME}"
+
+      - name: Setup Go
+        if: steps.meta.outputs.should_build == 'true'
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: /tmp/cloudflared/go.mod
+          cache: false
+
+      - name: Build cloudflared binaries (amd64, arm64, arm/v7)
+        if: steps.meta.outputs.should_build == 'true'
+        env:
+          TARGET_VERSION: ${{ steps.meta.outputs.version }}
+          BUILD_TIME: ${{ steps.source.outputs.build_time }}
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/build-ctx
+          mkdir -p /tmp/build-ctx/linux/amd64 /tmp/build-ctx/linux/arm64 /tmp/build-ctx/linux/arm/v7
+
+          LDFLAGS="-s -w -X \"main.Version=${TARGET_VERSION}\" -X \"main.BuildTime=${BUILD_TIME}\" -X \"github.com/cloudflare/cloudflared/metrics.Runtime=virtual\""
+
+          cd /tmp/cloudflared
+          export CGO_ENABLED=0
+          export GOFIPS140=off
+
+          echo "Building linux/amd64..."
+          GOOS=linux GOARCH=amd64 go build -mod=readonly -trimpath -ldflags="${LDFLAGS}" -o /tmp/build-ctx/linux/amd64/cloudflared ./cmd/cloudflared
+
+          echo "Building linux/arm64..."
+          GOOS=linux GOARCH=arm64 go build -mod=readonly -trimpath -ldflags="${LDFLAGS}" -o /tmp/build-ctx/linux/arm64/cloudflared ./cmd/cloudflared
+
+          echo "Building linux/arm/v7..."
+          GOOS=linux GOARCH=arm GOARM=7 go build -mod=readonly -trimpath -ldflags="${LDFLAGS}" -o /tmp/build-ctx/linux/arm/v7/cloudflared ./cmd/cloudflared
+
+          chmod +x \
+            /tmp/build-ctx/linux/amd64/cloudflared \
+            /tmp/build-ctx/linux/arm64/cloudflared \
+            /tmp/build-ctx/linux/arm/v7/cloudflared
+
+          file \
+            /tmp/build-ctx/linux/amd64/cloudflared \
+            /tmp/build-ctx/linux/arm64/cloudflared \
+            /tmp/build-ctx/linux/arm/v7/cloudflared
+          ls -lh \
+            /tmp/build-ctx/linux/amd64/cloudflared \
+            /tmp/build-ctx/linux/arm64/cloudflared \
+            /tmp/build-ctx/linux/arm/v7/cloudflared
+
+      - name: Setup QEMU
+        if: steps.meta.outputs.should_build == 'true'
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64,arm
+
+      - name: Setup Docker Buildx
+        if: steps.meta.outputs.should_build == 'true'
+        uses: docker/setup-buildx-action@v4
+
+      - name: Smoke test linux/amd64 image
+        if: steps.meta.outputs.should_build == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: /tmp/build-ctx
+          file: ${{ github.workspace }}/Dockerfile
+          platforms: linux/amd64
+          load: true
+          provenance: false
+          sbom: false
+          tags: cloudflared-amd64:test
+
+      - name: Smoke test linux/arm64 image
+        if: steps.meta.outputs.should_build == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: /tmp/build-ctx
+          file: ${{ github.workspace }}/Dockerfile
+          platforms: linux/arm64
+          load: true
+          provenance: false
+          sbom: false
+          tags: cloudflared-arm64:test
+
+      - name: Smoke test linux/arm/v7 image
+        if: steps.meta.outputs.should_build == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: /tmp/build-ctx
+          file: ${{ github.workspace }}/Dockerfile
+          platforms: linux/arm/v7
+          load: true
+          provenance: false
+          sbom: false
+          tags: cloudflared-armv7:test
+
+      - name: Run container smoke tests
+        if: steps.meta.outputs.should_build == 'true'
+        run: |
+          set -euo pipefail
+          docker run --rm --platform linux/amd64 cloudflared-amd64:test version
+          docker run --rm --platform linux/arm64 cloudflared-arm64:test version
+          docker run --rm --platform linux/arm/v7 cloudflared-armv7:test version
+          docker run --rm --platform linux/arm/v7 cloudflared-armv7:test tunnel --help | sed -n '1,10p'
+
+      - name: Build & push multi-arch manifest (amd64 + arm64 + arm/v7)
+        if: steps.meta.outputs.should_build == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: /tmp/build-ctx
+          file: ${{ github.workspace }}/Dockerfile
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          push: true
+          provenance: false
+          sbom: false
+          tags: ${{ steps.meta.outputs.tags }}
+
+      - name: Verify published manifest
+        if: steps.meta.outputs.should_build == 'true'
+        run: |
+          set -euo pipefail
+          echo "=== Final Multi-Arch Manifest ==="
+          docker buildx imagetools inspect "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}"
