@@ -217,6 +217,17 @@ jobs:
         if: steps.meta.outputs.should_build == 'true'
         run: |
           set -euo pipefail
+          for spec in "cloudflared-amd64:test|x86-64" "cloudflared-arm64:test|ARM aarch64" "cloudflared-armv7:test|ARM, EABI5"; do
+            img="${spec%%|*}"
+            expected="${spec#*|}"
+            cid=$(docker create "$img")
+            docker cp "$cid:/usr/local/bin/cloudflared" /tmp/cf_verify
+            docker rm "$cid" >/dev/null
+            INFO=$(file /tmp/cf_verify)
+            rm -f /tmp/cf_verify
+            echo "${img}: ${INFO}"
+            echo "${INFO}" | grep -q "${expected}"
+          done
           docker run --rm --platform linux/amd64 cloudflared-amd64:test version
           docker run --rm --platform linux/arm64 cloudflared-arm64:test version
           docker run --rm --platform linux/arm/v7 cloudflared-armv7:test version

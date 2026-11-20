@@ -1,6 +1,6 @@
 FROM gcr.io/distroless/base-debian13:nonroot
 
-ARG TARGETPLATFORM=linux/amd64
+ARG TARGETPLATFORM
 
 COPY --chown=65532:65532 ${TARGETPLATFORM}/cloudflared /usr/local/bin/cloudflared
 
